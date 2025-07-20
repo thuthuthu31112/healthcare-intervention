@@ -1,0 +1,829 @@
+# ----------------------------
+# 1. THIẾT LẬP THƯ VIỆN
+# ----------------------------
+library(readxl)
+library(janitor)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(readr)
+library(ggplot2)
+library(lubridate)
+library(furrr)
+library(scales)
+library(patchwork)
+
+# Cấu hình xử lý song song
+plan(multisession, workers = max(1, availableCores() - 1))
+
+# ----------------------------
+# 2. LOAD DỮ LIỆU
+# ----------------------------
+# Load dataset chính và làm sạch tên cột
+dataset <- read_csv("2024-srcsc-superlife-inforce-dataset.csv", skip = 3) %>% clean_names()
+
+# Load các dataset phụ
+interventions <- read_excel("srcsc-2024-interventions.xlsx", skip = 14) %>% clean_names()
+economic <- read_excel("srcsc-2024-lumaria-economic-data.xlsx", skip = 10) %>% clean_names()
+mortality <- read_excel("srcsc-2024-lumaria-mortality-table.xlsx", skip = 12) %>% clean_names()
+mortality_impact <- read_excel("Intervention_Mortality_Impact_Full.xlsx") %>% clean_names()
+
+# ----------------------------
+# 3. TIỀN XỬ LÝ DỮ LIỆU
+# ----------------------------
+# Lọc các hợp đồng còn hiệu lực
+dataset <- dataset %>%
+  filter(is.na(death_indicator), is.na(lapse_indicator)) %>%
+  select(-death_indicator, -year_of_death, -lapse_indicator, -year_of_lapse, -cause_of_death) %>%
+  mutate(across(c(policy_type, sex, smoker_status, underwriting_class, 
+                  urban_vs_rural, region, distribution_channel), as.factor))
+
+# One-Hot Encoding cho đặc điểm khách hàng
+customers_dummy <- dataset %>%
+  mutate(
+    age_26_40 = between(issue_age, 26, 40),
+    age_41_55 = between(issue_age, 41, 55),
+    age_56_65 = between(issue_age, 56, 65),
+    sex_f = sex == "F",
+    sex_m = sex == "M",
+    smoker_ns = smoker_status == "NS",
+    smoker_s = smoker_status == "S",
+    risk_low = str_detect(underwriting_class, "low risk"),
+    risk_mod = str_detect(underwriting_class, "moderate risk"),
+    risk_high = str_detect(underwriting_class, "high risk"),
+    urban = urban_vs_rural == "Urban",
+    rural = urban_vs_rural == "Rural",
+    agent = distribution_channel == "Agent",
+    online = distribution_channel == "Online",
+    telemarketer = distribution_channel == "Telemarketer"
+  ) %>%
+  mutate(across(everything(), as.integer)) %>%
+  mutate(policy_number = c(1:nrow(dataset)))
+
+# ----------------------------
+# 4. XỬ LÝ INTERVENTIONS
+# ----------------------------
+# Gắn thông tin intervention
+intervention_impact <- mortality_impact %>%
+  inner_join(interventions, by = "intervention_name")
+
+# Tính % khách hàng phù hợp cho từng intervention
+intervention_match_summary <- pmap_dfr(intervention_impact, function(...) {
+  row <- tibble(...)
+  zero_cols <- names(row)[which(row == 0)]
+  zero_cols <- setdiff(zero_cols, c("intervention_name", "intervention_group"))
+  
+  filtered_customers <- customers_dummy %>%
+    filter(if_all(all_of(zero_cols), ~ . == 0))
+  
+  tibble(
+    intervention_name = row$intervention_name,
+    matched_percent = nrow(filtered_customers) / nrow(customers_dummy)
+  )
+})
+
+intervention_impact <- intervention_impact %>%
+  left_join(intervention_match_summary, by = "intervention_name")
+
+# Trích xuất số từ chuỗi mô tả
+intervention_clean <- intervention_impact %>%
+  mutate(
+    mortality_avg = str_extract_all(approximate_impact_on_mortality_rates, "\\d+") %>%
+      map_dbl(~ mean(as.numeric(.))),
+    cost_avg = str_extract_all(approximate_per_capita_cost, "\\d+") %>%
+      map_dbl(~ mean(as.numeric(.)))
+  )
+
+# Vẽ hiệu quả giảm tử vong
+ggplot(intervention_clean, aes(x = reorder(intervention_name, mortality_avg), y = mortality_avg)) +
+  geom_col(fill = "lightsteelblue") +
+  coord_flip() +
+  labs(title = "Hiệu quả giảm tử vong trung bình", x = "", y = "% giảm tử vong")
+ggsave("mortality_reduction.png")
+
+summary_by_group <- intervention_clean %>%
+  group_by(intervention_group) %>%
+  summarise(
+    avg_mortality_reduction = mean(mortality_avg, na.rm = TRUE),
+    avg_per_capita_cost = mean(cost_avg, na.rm = TRUE),
+    avg_matched_percent = mean(matched_percent, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    cost_per_mortality_reduction = avg_per_capita_cost / avg_mortality_reduction
+  ) %>%
+  arrange(
+    desc(avg_matched_percent),
+    cost_per_mortality_reduction
+  ) %>%
+  select(intervention_group, avg_matched_percent, cost_per_mortality_reduction)
+
+# ----------------------------
+# VẼ BIỂU ĐỒ SO SÁNH NHÓM CAN THIỆP
+# ----------------------------
+
+# 1. Biểu đồ tỷ lệ phù hợp (avg_matched_percent)
+matched_plot <- ggplot(summary_by_group, 
+                       aes(x = reorder(intervention_group, avg_matched_percent), 
+                           y = avg_matched_percent)) +
+  geom_col(fill = "lightsteelblue", alpha = 0.8) +
+  geom_text(aes(label = scales::percent(avg_matched_percent, accuracy = 0.1)), 
+            hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(title = "Tỷ lệ khách hàng phù hợp theo nhóm can thiệp",
+       x = "Nhóm can thiệp",
+       y = "Tỷ lệ phù hợp") +
+  theme_minimal()
+
+# 2. Biểu đồ chi phí trên mỗi đơn vị giảm tử vong
+cost_eff_plot <- ggplot(summary_by_group, 
+                        aes(x = reorder(intervention_group, cost_per_mortality_reduction), 
+                            y = cost_per_mortality_reduction)) +
+  geom_col(fill = "lightsteelblue", alpha = 0.8) +
+  geom_text(aes(label = scales::dollar(cost_per_mortality_reduction, accuracy = 1)), 
+            hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "Chi phí trên mỗi đơn vị giảm tử vong",
+       x = "Nhóm can thiệp",
+       y = "Chi phí ($) / 1% giảm tử vong") +
+  theme_minimal()
+
+# 3. Biểu đồ kết hợp cả 2 chỉ số
+combined_plot <- ggplot(summary_by_group, 
+                        aes(x = avg_matched_percent, 
+                            y = cost_per_mortality_reduction,
+                            color = intervention_group)) +
+  geom_point(size = 5, alpha = 0.7) +
+  geom_text(aes(label = intervention_group), 
+            vjust = -1, size = 3.5, check_overlap = TRUE) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(title = "Hiệu quả và Chi phí các Nhóm Can thiệp",
+       x = "Tỷ lệ khách hàng phù hợp",
+       y = "Chi phí / 1% giảm tử vong",
+       color = "Nhóm can thiệp") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Xuất biểu đồ
+ggsave("plots/matched_percent_by_group.png", matched_plot, width = 8, height = 5)
+ggsave("plots/cost_efficiency_by_group.png", cost_eff_plot, width = 8, height = 5)
+ggsave("plots/intervention_group_comparison.png", combined_plot, width = 9, height = 6)
+
+# Xuất kết quả
+write_csv(summary_by_group, "intervention_summary.csv")
+
+# Chọn nhóm 6
+intervention_clean <- intervention_clean %>%
+  filter(str_detect(intervention_group, "Group 6"))
+
+# ----------------------------
+# 5. TIMELINE INTERVENTIONS
+# ----------------------------
+# Tạo timeline data
+interventions <- tibble(
+  Intervention = c(
+    "Financial Literacy Workshops", 
+    "Sun Safety Awareness",
+    "Hydration Campaigns",
+    "Online Health Resources",
+    "Personalized Health Plans",
+    "Holistic Health Assessments",
+    "Educational Workshops",
+    "Environmental Wellness",
+    "Community Gardens",
+    "Travel Safety Tips"
+  ),
+  Start = as.Date(c(
+    "2024-01-01", "2024-01-01", "2024-01-01", "2024-01-01", 
+    "2024-01-01", "2024-01-01", "2024-01-01", "2024-01-01",
+    "2024-01-01", "2024-01-01"
+  )),
+  End = as.Date(c(
+    "2034-12-31", "2025-12-31", "2026-12-31", "2034-12-31",
+    "2034-12-31", "2034-12-31", "2027-12-31", "2027-12-31",
+    "2027-12-31", "2027-12-31"
+  )),
+  Frequency = c(
+    "2 years", "6 months", "1 week", "1 month",
+    "6 months", "6 months", "6 months", "6 months", 
+    "1 year", "1 year"
+  ),
+  Group = c(
+    "Financial Group",
+    "Behavioral Group",
+    "Behavioral Group",
+    "Update Group",
+    "Health Plan Group",
+    "Health Plan Group",
+    "Education Group",
+    "Education Group",
+    "Education Group",
+    "Education Group"
+  )
+)
+
+# Hàm tạo schedule
+generate_schedule <- function(name, start, end, freq, group) {
+  if(freq == "2 years") {
+    seq_dates <- seq(start, end, by = "2 years")
+  } else if(freq == "6 months") {
+    seq_dates <- seq(start, end, by = "6 months")
+  } else if(freq == "1 week") {
+    seq_dates <- seq(start, end, by = "1 week")
+  } else if(freq == "1 month") {
+    seq_dates <- seq(start, end, by = "1 month")
+  } else if(freq == "1 year") {
+    seq_dates <- seq(start, end, by = "1 year")
+  } else {
+    seq_dates <- NULL
+  }
+  
+  tibble(
+    Intervention = name,
+    Date = seq_dates,
+    Group = group
+  )
+}
+
+# Tạo detailed schedule
+detailed_schedule <- interventions %>%
+  rowwise() %>%
+  do(generate_schedule(.$Intervention, .$Start, .$End, .$Frequency, .$Group)) %>%
+  ungroup() %>%
+  mutate(Intervention = factor(Intervention, levels = rev(unique(interventions$Intervention))))
+
+# Vẽ timeline
+timeline_plot <- ggplot(detailed_schedule, aes(x = Date, y = Intervention, color = Group)) +
+  geom_point(size = 2) +
+  scale_x_date(breaks = seq(as.Date("2024-01-01"), as.Date("2034-12-31"), by = "2 years"),
+               date_labels = "%Y") +
+  scale_color_brewer(palette = "Pastel1") +
+  labs(title = "INTERVENTION IMPLEMENTATION TIMELINE",
+       x = "Time", y = "", color = "Group") +
+  theme_minimal()
+
+ggsave("intervention_timeline.png", timeline_plot, width = 10, height = 6)
+
+# ----------------------------
+# 6. MÔ PHỎNG
+
+# Lấy mẫu
+set.seed(123)
+#đọc timeline
+timeline_data <- read_excel("timeline_data.xlsx")
+customers_dummy <- customers_dummy[sample(nrow(dataset), 200), ]
+
+# ----------------------------
+# Hàm tính toán chính
+calculate_payout <- function(policy_type, issue_year, current_year, face_amount) {
+  ifelse((policy_type == 'T20') & (current_year - issue_year >= 20), 0, face_amount)
+}
+
+calculate_mortality <- function(issue_age, issue_year, current_year, mortality) {
+  age <- issue_age + (current_year - issue_year)
+  if(age > nrow(mortality) | age < 1) return(1)
+  mortality[age, 'mortality_rate'][[1]]
+}
+
+calculate_intervention_cost <- function(policy_type, issue_year, current_year, timeline_data, intervention_clean) {
+  if((policy_type == 'T20') & (current_year - issue_year >= 20)) return(0)
+  
+  year_col <- paste0("year_", current_year)
+  if(!year_col %in% names(timeline_data)) return(0)
+  
+  timeline_data %>%
+    left_join(intervention_clean, by = c('intervention' = 'intervention_name')) %>%
+    filter(!is.na(.data[[year_col]]), .data[[year_col]] != 0) %>%
+    summarise(total_cost = sum(.data[[year_col]] * cost_avg, na.rm = TRUE)) %>%
+    pull(total_cost)
+}
+
+calculate_mortality_reduction <- function(i, customers_dummy, intervention_clean) {
+  traits <- c(
+    "age_26_40", "age_41_55", "age_56_65",
+    "sex_f", "sex_m",
+    "smoker_ns", "smoker_s",
+    "risk_low", "risk_mod", "risk_high",
+    "urban", "rural",
+    "agent", "online", "telemarketer"
+  )
+  
+  customer_data <- customers_dummy %>%
+    filter(policy_number == i) %>%
+    select(all_of(traits))
+  
+  result_table <- intervention_clean %>%
+    select(intervention_name, mean_mortality_reduction = mortality_avg, all_of(traits)) %>%
+    mutate(
+      binary_flag = pmap_int(select(., all_of(traits)), function(...) {
+        intervention_traits <- list(...)
+        any_conflict <- any(map2_lgl(intervention_traits, customer_data, 
+                                     ~ (.x == 0) && (.y == 1)))
+        as.integer(!any_conflict)
+      })
+    ) %>%
+    filter(binary_flag == 1)
+  
+  if (nrow(result_table) == 0) 0 else sum(result_table$mean_mortality_reduction, na.rm = TRUE)
+}
+
+# Hàm mô phỏng theo năm
+simulate_year <- function(current_year, n_simulations = 10) {
+  cat("Simulating year", current_year, "...\n")
+  
+  results <- future_map_dfr(1:nrow(customers_dummy), function(i) {
+    policy <- customers_dummy[i,]
+    issue_yr <- policy$issue_year
+    if(issue_yr > current_year) return(tibble(
+      simulation_id = integer(),
+      with_intervention = numeric(),
+      without_intervention = numeric(),
+      difference = numeric(),
+      intervention_cost = numeric()
+    ))
+    
+    # Tính toán tỷ lệ tử vong
+    p_cumulative_with <- 0
+    p_cumulative_without <- 0
+    
+    for(year in issue_yr:(current_year-1)) {
+      mort_rate <- calculate_mortality(policy$issue_age, issue_yr, year, mortality)
+      k <- calculate_mortality_reduction(i, customers_dummy, intervention_clean)
+      p_cumulative_with <- p_cumulative_with + mort_rate * (1 - k)
+      p_cumulative_without <- p_cumulative_without + mort_rate
+    }
+    
+    current_mort <- calculate_mortality(policy$issue_age, issue_yr, current_year, mortality)
+    k_current <- calculate_mortality_reduction(i, customers_dummy, intervention_clean)
+    
+    # Tính toán chi phí và chi trả
+    payout_val <- calculate_payout(policy$policy_type, issue_yr, current_year, policy$face_amount)
+    cost_val <- calculate_intervention_cost(policy$policy_type, issue_yr, current_year, timeline_data, intervention_clean)
+    
+    # Mô phỏng
+    map_dfr(1:n_simulations, ~{
+      # Với can thiệp
+      u <- runif(1)
+      status_with <- case_when(
+        u < p_cumulative_with ~ "died_before",
+        (u < p_cumulative_with + current_mort * (1 - k_current)) & (u > p_cumulative_with) ~ "died_current",
+        TRUE ~ "survived"
+      )
+      
+      # Không can thiệp
+      status_without <- case_when(
+        u < p_cumulative_without ~ "died_before",
+        (u < p_cumulative_without + current_mort) & (u > p_cumulative_without) ~ "died_current",
+        TRUE ~ "survived"
+      )
+      
+      # Tính toán kết quả
+      tibble(
+        simulation_id = .x,
+        with_intervention = case_when(
+          status_with == "died_before" ~ 0,
+          status_with == "died_current" ~ payout_val,
+          TRUE ~ 0
+        ),
+        without_intervention = case_when(
+          status_without == "died_before" ~ 0,
+          status_without == "died_current" ~ payout_val,
+          TRUE ~ 0
+        ),
+        intervention_cost = case_when(
+          status_without == "died_current" ~ cost_val,
+          status_with != "died_before" ~ 0,
+          TRUE ~ cost_val
+        )
+      )
+    })
+  }, .progress = TRUE)
+  
+  # Tổng hợp kết quả
+  results %>%
+    group_by(simulation_id) %>%
+    summarise(
+      total_with = sum(with_intervention, na.rm = TRUE),
+      total_without = sum(without_intervention, na.rm = TRUE),
+      total_intervention_cost = sum(intervention_cost, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(year = current_year,
+           total_difference = total_without - total_intervention_cost - total_with,
+    )
+}
+
+# Chạy mô phỏng từ 2024-2032
+years <- 2024:2054
+simulation_results <- map_dfr(years, simulate_year, .progress = TRUE)
+
+# ----------------------------
+# 7. VISUALIZATION KẾT QUẢ
+# ----------------------------
+# Tổng hợp kết quả
+summary_data <- simulation_results %>%
+  group_by(year) %>%
+  summarise(
+    avg_savings = mean(total_difference),
+    sd_saving = sd(total_difference),
+    avg_cost = mean(total_intervention_cost),
+    sd_cost = sd(total_intervention_cost),
+    .groups = "drop"
+  )
+
+# Biểu đồ so sánh chi phí
+saving_plot <- ggplot(summary_data, aes(x = year)) +
+  geom_line(aes(y = avg_savings, color = "Chênh lệch khoản phải trả hằng năm nếu có chương trình"), size = 1.2) +
+  geom_ribbon(aes(ymin = 0, ymax = avg_savings, fill = "Tiết kiệm"), alpha = 0.3) +
+  scale_y_continuous(labels = dollar_format(scale = 1e-6, suffix = "M")) +
+  scale_color_manual(values = "#377EB8") +
+  scale_fill_manual(values = c("Tiết kiệm" = "lightsteelblue")) +
+  labs(title = "So sánh Chi phí Trung bình Hàng năm",
+       x = "Năm", y = "Chi phí ($)")
+
+# Lưu đồ thị
+ggsave("saving_plot.png", saving_plot, width = 10, height = 6)
+
+# Xuất kết quả
+write.csv(simulation_results, "simulation_results.csv")
+write.csv(summary_data, "summary_results.csv")
+
+# Xuất thêm chi tiết
+simulation_results %>% 
+  group_by(year) %>%
+  summarise(
+    total_diffence_mean = mean(total_difference), 
+    total_diffence_sd = sd(total_difference), 
+    total_cost_mean = mean(total_intervention_cost),
+    total_cost_sd = sd(total_intervention_cost)
+  ) %>%
+  distinct() %>%
+  write.csv("detailed_results.csv")
+
+# ----------------------------
+# 8. PHÂN TÍCH CHI PHÍ VÀ NPV (LÃI SUẤT 5%)
+# ----------------------------
+
+# Calculate average and standard deviation of cost per year
+cost_by_year <- simulation_results %>%
+  group_by(year) %>%
+  summarise(
+    total_cost = mean(total_intervention_cost),
+    sd_cost = sd(total_intervention_cost),
+    .groups = "drop"
+  )
+
+# Plot: Line chart with ribbon for ±1 SD
+cost_plot = ggplot(cost_by_year, aes(x = year, y = total_cost)) +
+  geom_line(color = "lightsteelblue", size = 1.2) +
+  geom_ribbon(aes(ymin = total_cost - sd_cost, ymax = total_cost + sd_cost),
+              fill = "lightsteelblue", alpha = 0.3) +
+  labs(
+    title = "Annual Intervention Cost and Standard Deviation",
+    x = "Year",
+    y = "Cost (Million USD)"
+  ) +
+  theme_minimal(base_family = "sans") +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12)
+  )
+
+intervention_ratios = intervention_clean %>%
+  inner_join(timeline_data, by = c('intervention_name' = 'intervention')) %>%
+  dplyr::select(intervention_name, cost_avg, starts_with('year')) %>%
+  pivot_longer(
+    cols = starts_with("year_"),
+    names_to = "year",
+    names_prefix = "year_",
+    values_to = "count"
+  ) %>%
+  mutate(
+    year = as.integer(year),
+    total_cost = cost_avg * count
+  ) %>%
+  group_by(year) %>%
+  mutate(
+    year_total_cost = sum(total_cost, na.rm = TRUE),
+    cost_ratio = ifelse(year_total_cost == 0, 0, total_cost / year_total_cost)
+  ) %>%
+  ungroup()
+
+library(ggplot2)
+library(dplyr)
+library(RColorBrewer)
+
+# Lấy 6 năm đầu
+plot_data <- intervention_ratios %>%
+  filter(year >= 2024 & year <= 2029)
+
+# Số intervention cần màu
+n_colors <- length(unique(plot_data$intervention_name))
+
+# Lấy bảng màu Pastel1 và Pastel2, ghép lại
+pastel_palette <- c(brewer.pal(9, "Pastel1"), brewer.pal(8, "Pastel2"))
+pastel_colors <- pastel_palette[1:n_colors]  # cắt theo số intervention thực tế
+
+# Vẽ stacked bar chart pastel đa màu
+cost_ratio_plot = ggplot(plot_data, aes(x = factor(year), y = cost_ratio, fill = intervention_name)) +
+  geom_bar(stat = "identity", position = "fill", color = "white") +
+  scale_fill_manual(values = pastel_colors) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Phân bổ Tỷ lệ Chi phí của Các Intervention theo Năm (2024–2029)",
+    x = "Năm",
+    y = "Tỷ lệ Chi phí (%)",
+    fill = "Intervention"
+  ) +
+  theme_minimal(base_family = "sans") +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12),
+    legend.text = element_text(size = 9),
+    legend.title = element_text(face = "bold")
+  )
+
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+# Chuẩn bị dữ liệu bảng: pivot wider
+intervention_table <- intervention_ratios %>%
+  filter(year >= 2024 & year <= 2029) %>%
+  mutate(cost_ratio_percent = round(cost_ratio * 100, 1)) %>%
+  select(intervention_name, year, cost_ratio_percent) %>%
+  tidyr::pivot_wider(names_from = year, values_from = cost_ratio_percent)
+
+# Xuất bảng đẹp bằng kable
+intervention_table %>%
+  kable("html", col.names = c("Intervention", "2024", "2025", "2026", "2027", "2028", "2029"), 
+        caption = "Tỷ lệ Chi phí (%) theo Intervention và Năm") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                full_width = FALSE, font_size = 12)
+
+
+ggsave("plots/cost_by_year.png", cost_plot, width = 8, height = 5)
+ggsave("plots/cost_ratio.png", cost_ratio_plot, width = 8, height = 5)
+
+saving_by_year <- simulation_results %>%
+  group_by(year) %>%
+  summarise(
+    total_saving = mean(total_difference),
+    sd_saving = sd(total_difference),
+    .groups = "drop"
+  )
+  
+saving_plot = ggplot(saving_by_year, aes(x = year, y = total_saving)) +
+  geom_line(color = "lightsteelblue", size = 1.2) +
+  geom_ribbon(aes(ymin = total_saving - sd_saving, ymax = total_saving + sd_saving),
+              fill = "lightsteelblue", alpha = 0.3) +
+  labs(
+    title = "Annual Intervention Saving and Standard Deviation",
+    x = "Year",
+    y = "Cost (Million USD)"
+  ) +
+  theme_minimal(base_family = "sans") +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 12)
+  )
+
+ggsave('plots/saving_plot.png', saving_plot, width = 8, height = 5)
+# Tính NPV với lãi suất 5%
+npv_cost <- cost_by_year %>%
+  mutate(
+    discounted_cost = total_cost / (1 + 0.05)^(year - min(year))
+  ) %>%
+  summarise(
+    npv = sum(discounted_cost),
+    total_undiscounted = sum(total_cost)
+  )
+
+# ----------------------------
+# 9. PHÂN TÍCH NPV CHO CHÊNH LỆCH CHI PHÍ (DIFFERENCE)
+# ----------------------------
+
+# Tính chênh lệch chi phí theo năm từ kết quả mô phỏng
+difference_by_year <- simulation_results %>%
+  group_by(year) %>%
+  summarise(
+    avg_difference = mean(total_difference),
+    .groups = "drop"
+  )
+
+# Tính NPV cho chênh lệch với lãi suất 5%
+npv_difference <- difference_by_year %>%
+  mutate(
+    discounted_difference = avg_difference / (1 + 0.05)^(year - min(year))
+  ) %>%
+  summarise(
+    npv_difference = sum(discounted_difference),
+    total_undiscounted_difference = sum(avg_difference)
+  )
+
+# Vẽ biểu đồ chênh lệch chi phí theo năm
+difference_plot <- ggplot(difference_by_year, aes(x = year, y = avg_difference)) +
+  geom_col(fill = "lightsteelblue", alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(title = "Chênh lệch chi phí trung bình theo năm",
+       subtitle = "Có can thiệp vs Không can thiệp",
+       x = "Năm",
+       y = "Chênh lệch chi phí") +
+  theme_minimal()
+
+# Xuất biểu đồ và kết quả
+ggsave("plots/difference_by_year.png", difference_plot, width = 8, height = 5)
+
+# ----------------------------
+# 11. PHÂN TÍCH PHÂN PHỐI NPV (FULL VERSION)
+# ----------------------------
+
+# Tính NPV cho từng simulation (lãi suất 5%)
+npv_results <- simulation_results %>%
+  group_by(simulation_id) %>%
+  summarise(
+    npv_difference = sum(total_difference / (1 + 0.05)^(year - min(year))),
+    npv_cost = sum(total_intervention_cost / (1 + 0.05)^(year - min(year))),
+    .groups = "drop"
+  )
+
+# Tính các giá trị thống kê quan trọng
+npv_stats <- npv_results %>%
+  summarise(
+    mean_diff = mean(npv_difference),
+    median_diff = median(npv_difference),
+    sd_diff = sd(npv_difference),
+    prob_negative = mean(npv_difference < 0),
+    prob_positive = mean(npv_difference > 0),
+    min_diff = min(npv_difference),
+    max_diff = max(npv_difference)
+  )
+
+# 1. Biểu đồ phân phối NPV Difference (FULL)
+npv_diff_dist <- ggplot(npv_results, aes(x = npv_difference)) +
+  # Histogram với density
+  geom_histogram(aes(y = ..density..), 
+                 bins = 30,
+                 fill = "lightsteelblue",
+                 color = "white",
+                 alpha = 0.8) +
+  # Đường density
+  geom_density(color = "#377EB8", size = 1.2) +
+  # Đường zero line
+  geom_vline(xintercept = 0, 
+             linetype = "dashed", 
+             color = "red",
+             size = 1) +
+  # Đường mean
+  geom_vline(xintercept = npv_stats$mean_diff, 
+             linetype = "dashed", 
+             color = "darkblue",
+             size = 1) +
+  # Tô màu vùng NPV < 0
+  geom_area(data = ~ {
+    dens <- density(.x$npv_difference)
+    tibble(x = dens$x, y = dens$y) %>% filter(x < 0)
+  },
+  aes(x = x, y = y),
+  fill = "red",
+  alpha = 0.3) +
+  # Chú thích thống kê
+  annotate("text",
+           x = quantile(npv_results$npv_difference, 0.1),
+           y = Inf,
+           vjust = 2,
+           label = paste0(
+             "Mean = ", dollar(npv_stats$mean_diff), "\n",
+             "P(NPV < 0) = ", percent(npv_stats$prob_negative, accuracy = 0.1), "\n",
+             "Min = ", dollar(npv_stats$min_diff), "\n",
+             "Max = ", dollar(npv_stats$max_diff)
+           ),
+           color = "black",
+           size = 4) +
+  scale_x_continuous(labels = scales::dollar_format(scale = 1e-6, suffix = "M"),
+                     breaks = scales::pretty_breaks(n = 8)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "PHÂN PHỐI NPV CHÊNH LỆCH CHI PHÍ",
+       subtitle = "Can thiệp vs Không can thiệp (Discount rate = 5%)",
+       x = "NPV Difference ($)",
+       y = "Mật độ",
+       caption = "Vùng đỏ thể hiện NPV âm (bất lợi)") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray50"),
+    panel.grid.minor = element_blank()
+  )
+
+# 2. Biểu đồ phân phối NPV Cost (FULL)
+npv_cost_dist <- ggplot(npv_results, aes(x = npv_cost)) +
+  geom_histogram(aes(y = ..density..), 
+                 bins = 30,
+                 fill = "lightsteelblue",
+                 color = "white",
+                 alpha = 0.8) +
+  geom_density(color = "#377EB8", size = 1.2) +
+  geom_vline(xintercept = mean(npv_results$npv_cost), 
+             linetype = "dashed", 
+             color = "darkblue",
+             size = 1) +
+  annotate("text",
+           x = quantile(npv_results$npv_cost, 0.1),
+           y = Inf,
+           vjust = 2,
+           label = paste0(
+             "Mean = ", dollar(mean(npv_results$npv_cost)), "\n",
+             "Min = ", dollar(min(npv_results$npv_cost)), "\n",
+             "Max = ", dollar(max(npv_results$npv_cost))
+           ),
+           color = "black",
+           size = 4) +
+  scale_x_continuous(labels = scales::dollar_format(scale = 1e-6, suffix = "M")) +
+  labs(title = "PHÂN PHỐI NPV CHI PHÍ CAN THIỆP",
+       subtitle = "Tổng chi phí hiện tại hóa (Discount rate = 5%)",
+       x = "NPV Cost ($)",
+       y = "Mật độ") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray50")
+  )
+
+# 3. Biểu đồ boxplot so sánh (FULL)
+npv_boxplot <- ggplot(npv_results) +
+  geom_boxplot(aes(y = npv_difference, x = "Chênh lệch"), 
+               fill = "lightsteelblue",
+               width = 0.3) +
+  geom_boxplot(aes(y = npv_cost, x = "Chi phí"), 
+               fill = "lightsteelblue",
+               width = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  scale_y_continuous(labels = scales::dollar_format(scale = 1e-6, suffix = "M"),
+                     breaks = scales::pretty_breaks(n = 8)) +
+  labs(title = "SO SÁNH PHÂN PHỐI NPV",
+       subtitle = "Boxplot phân bố giá trị",
+       x = "Loại",
+       y = "Giá trị NPV ($)") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray50")
+  )
+
+
+# Lưu các biểu đồ chất lượng cao
+ggsave("plots/FULL_npv_difference_dist.png", npv_diff_dist, 
+       width = 10, height = 6, dpi = 300)
+ggsave("plots/FULL_npv_cost_dist.png", npv_cost_dist, 
+       width = 10, height = 6, dpi = 300)
+
+# Xuất bảng thống kê chi tiết
+npv_stats %>%
+  mutate(across(where(is.numeric), ~ dollar(.x, scale = 1e-6, suffix = "M"))) %>%
+  write_csv("results/FULL_npv_statistics.csv")
+# ----------------------------
+# 12. PHÂN TÍCH ĐỘ NHẠY LÃI SUẤT
+# ----------------------------
+       
+# Hàm tính NPV với lãi suất khác nhau
+  calculate_npv <- function(rate) {
+    simulation_results %>%
+      group_by(simulation_id) %>%
+      summarise(
+        npv = sum(total_difference / (1 + rate)^(year - min(year)))
+        ) %>%
+      pull(npv) %>%
+      mean()
+    }
+       
+# Tạo grid lãi suất từ 1% đến 10%
+  rates_grid <- seq(0.01, 0.10, by = 0.01)
+       
+# Tính NPV cho từng lãi suất
+  sensitivity_results <- map_dbl(rates_grid, calculate_npv)
+       
+# Tạo dataframe kết quả
+  sensitivity_df <- tibble(
+    discount_rate = rates_grid,
+    mean_npv = sensitivity_results
+    )
+       
+# Vẽ biểu đồ độ nhạy
+  sensitivity_plot <- ggplot(sensitivity_df, aes(x = discount_rate, y = mean_npv)) +
+    geom_line(color = "#377EB8", size = 1.5) +
+    geom_point(color = "#377EB8", size = 3) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+    scale_x_continuous(labels = percent_format(accuracy = 1)) +
+    scale_y_continuous(labels = dollar_format(scale = 1e-6, suffix = "M")) +
+    labs(title = "Phân tích Độ nhạy theo Lãi suất Chiết khấu",
+         x = "Lãi suất Chiết khấu",
+         y = "NPV Trung bình ($)") +
+    theme_minimal()
+       
+  ggsave("plots/discount_rate_sensitivity.png", sensitivity_plot, width = 8, height = 6)
